@@ -13,6 +13,7 @@
 #include "nerd_dictation/backend_api.h"
 #include <sherpa-onnx/c-api/c-api.h>
 #include "model_loader.h"
+#include "models/gigaam-v3-ctc/tokens.h"
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -112,9 +113,10 @@ extern "C" nerd_dictation_t nerd_dictation_create(void) {
         config.model_config.nemo_ctc.model_buf = reinterpret_cast<const char*>(backend->embedded_model_data);
         config.model_config.nemo_ctc.model_buf_size = static_cast<int32_t>(backend->embedded_model_size);
 
-        /* Tokens file still needs a path - look in default location */
-        std::string model_dir = get_model_dir();
-        backend->tokens_path = model_dir + "/tokens.txt";
+        /* Use embedded tokens */
+        config.model_config.tokens = "";  /* No file path */
+        config.model_config.tokens_buf = gigaam::TOKENS_DATA;
+        config.model_config.tokens_buf_size = gigaam::TOKENS_SIZE;
     } else {
         /* Fall back to file-based loading */
         std::string model_dir = get_model_dir();
@@ -144,21 +146,20 @@ extern "C" nerd_dictation_t nerd_dictation_create(void) {
         config.model_config.nemo_ctc.model = backend->model_path.c_str();
     }
 
-    /* Check if tokens file exists */
-    FILE* f = fopen(backend->tokens_path.c_str(), "r");
-    if (!f) {
-        backend->error_message = "GigaAM: tokens file not found: " + backend->tokens_path;
-        std::cerr << "[GigaAM] ERROR: " << backend->error_message << std::endl;
-        if (backend->embedded_model_data) {
-            gigaam::free_embedded_model(backend->embedded_model_data, backend->embedded_model_size);
+    /* Check if tokens file exists (only for file-based loading) */
+    if (!use_embedded) {
+        FILE* f = fopen(backend->tokens_path.c_str(), "r");
+        if (!f) {
+            backend->error_message = "GigaAM: tokens file not found: " + backend->tokens_path;
+            std::cerr << "[GigaAM] ERROR: " << backend->error_message << std::endl;
+            delete backend;
+            return nullptr;
         }
-        delete backend;
-        return nullptr;
-    }
-    fclose(f);
+        fclose(f);
 
-    /* Tokens */
-    config.model_config.tokens = backend->tokens_path.c_str();
+        /* Tokens from file */
+        config.model_config.tokens = backend->tokens_path.c_str();
+    }
 
     /* General model config */
     config.model_config.num_threads = 4;

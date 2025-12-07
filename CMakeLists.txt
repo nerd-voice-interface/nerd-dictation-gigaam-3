@@ -11,7 +11,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 set(GIGAAM_MODEL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/models/gigaam-v3-ctc")
 set(GIGAAM_VOLUMES_DIR "${GIGAAM_MODEL_DIR}/volumes")
-set(GIGAAM_TOKENS "${GIGAAM_MODEL_DIR}/tokens.txt")
+set(GIGAAM_TOKENS_H "${GIGAAM_MODEL_DIR}/tokens.h")
 
 # Check model files exist for build
 if(NOT EXISTS "${GIGAAM_VOLUMES_DIR}/part_00.zst")
@@ -23,8 +23,8 @@ if(NOT EXISTS "${GIGAAM_VOLUMES_DIR}/part_00.zst")
     )
 endif()
 
-if(NOT EXISTS "${GIGAAM_TOKENS}")
-    message(FATAL_ERROR "GigaAM tokens not found: ${GIGAAM_TOKENS}")
+if(NOT EXISTS "${GIGAAM_TOKENS_H}")
+    message(FATAL_ERROR "GigaAM tokens header not found: ${GIGAAM_TOKENS_H}")
 endif()
 
 # ============================================================================
@@ -127,6 +127,7 @@ target_include_directories(nerd-dictation-gigaam
     PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}
     ${SHERPA_ONNX_DIR}/sherpa-onnx/c-api
     ${RES_EMBED_DIR}/include
     ${ZSTD_INCLUDE_DIRS}
@@ -206,10 +207,7 @@ install(TARGETS nerd-dictation-gigaam
     RUNTIME DESTINATION bin
 )
 
-# Install tokens.txt (required file - model is embedded but tokens need file path)
-install(FILES ${GIGAAM_TOKENS}
-    DESTINATION share/nerd-dictation-gigaam/model
-)
+# Tokens are now embedded via tokens.h header (no install needed)
 
 # Export symbols for shared library
 set_target_properties(nerd-dictation-gigaam PROPERTIES
@@ -244,6 +242,4 @@ target_link_libraries(test_transcribe PRIVATE
     ${TEST_VOLUME_LIBS}
 )
 
-# Make tokens.txt available for testing
-configure_file(${GIGAAM_TOKENS}
-    ${CMAKE_CURRENT_BINARY_DIR}/tokens.txt COPYONLY)
+# Tokens are now embedded via tokens.h header
