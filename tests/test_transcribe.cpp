@@ -62,22 +62,12 @@ static void result_callback(const struct nerd_dictation_result* result, void* us
 }
 
 int main(int argc, char* argv[]) {
-    const char* wav_path = nullptr;
-
-    /* Default test file path */
-    std::string default_path;
-#ifdef GIGAAM_MODEL_DIR
-    default_path = std::string(GIGAAM_MODEL_DIR) + "/test_wavs/example.wav";
-#else
-    default_path = "/usr/share/nerd-dictation-gigaam/model/test_wavs/example.wav";
-#endif
-
     if (argc < 2) {
-        wav_path = default_path.c_str();
-        std::cout << "Using default test file: " << wav_path << std::endl;
-    } else {
-        wav_path = argv[1];
+        std::cerr << "Usage: " << argv[0] << " <wav_file>" << std::endl;
+        return 1;
     }
+
+    const char* wav_path = argv[1];
 
     std::cout << "=== GigaAM Backend Test (C API) ===" << std::endl;
     std::cout << "Input file: " << wav_path << std::endl;
@@ -141,7 +131,7 @@ int main(int argc, char* argv[]) {
         std::cout << "Sample rate: " << info.sample_rate << " Hz" << std::endl;
     }
 
-    /* Transcribe using streaming API (actually batch for offline model) */
+    /* Transcribe using streaming API (batch mode for offline model) */
     std::cout << "\nTranscribing..." << std::endl;
 
     StreamContext stream_ctx;
@@ -161,22 +151,87 @@ int main(int argc, char* argv[]) {
         std::cerr << "Error: nerd_dictation_transcribe_stream returned " << ret << std::endl;
     }
 
-    /* Get result */
-    std::string result = stream_ctx.final_text;
+    /* Check if we got a result from streaming API */
+    std::string streaming_result = stream_ctx.final_text;
+    std::cout << "Streaming API result: \"" << streaming_result << "\"" << std::endl;
+
+    /* Reset and use manual loop for comparison */
+    nerd_dictation_reset(backend);
+    stream_ctx.offset = 0;
+    stream_ctx.final_text.clear();
+    stream_ctx.last_partial.clear();
+
+    std::cout << "\nTranscribing (manual loop)..." << std::endl;
+
+    std::vector<int16_t> chunk(stream_ctx.chunk_size);
+    std::string last_text;
+
+    while (stream_ctx.offset < stream_ctx.num_samples) {
+        size_t remaining = stream_ctx.num_samples - stream_ctx.offset;
+        size_t to_read = std::min(stream_ctx.chunk_size, remaining);
+
+        /* Feed audio */
+        ret = nerd_dictation_feed(backend, audio_data + stream_ctx.offset, to_read);
+        if (ret < 0) {
+            std::cerr << "Error: nerd_dictation_feed returned " << ret << std::endl;
+            nerd_dictation_destroy(backend);
+            return 1;
+        }
+        stream_ctx.offset += to_read;
+
+        /* Get result */
+        struct nerd_dictation_result result;
+        ret = nerd_dictation_result(backend, &result);
+        if (ret < 0) {
+            std::cerr << "Error: nerd_dictation_result returned " << ret << std::endl;
+            nerd_dictation_destroy(backend);
+            return 1;
+        }
+
+        if (result.text && strlen(result.text) > 0) {
+            std::string current_text(result.text);
+
+            if (result.is_final) {
+                stream_ctx.final_text = current_text;
+                std::cout << "[FINAL] " << current_text << std::endl;
+            } else if (current_text != last_text) {
+                std::cout << "[partial] " << current_text << std::endl;
+                last_text = current_text;
+            }
+        }
+    }
+
+    /* Finalize */
+    struct nerd_dictation_result final_result;
+    ret = nerd_dictation_finalize(backend, &final_result);
+    if (ret == 0 && final_result.text && strlen(final_result.text) > 0) {
+        std::string finalized(final_result.text);
+        if (finalized != stream_ctx.final_text) {
+            stream_ctx.final_text = finalized;
+            std::cout << "[FINALIZED] " << finalized << std::endl;
+        }
+    }
 
     /* Cleanup */
     nerd_dictation_destroy(backend);
 
-    /* Output result */
+    /* Compare with reference - use streaming_result from first pass */
     std::cout << "\n=== Result ===" << std::endl;
-    std::cout << "Transcription: \"" << result << "\"" << std::endl;
+    std::cout << "Transcription: \"" << streaming_result << "\"" << std::endl;
 
-    /* Basic validation */
-    if (result.empty()) {
-        std::cerr << "\n[FAIL] No transcription result" << std::endl;
+    const std::string reference = "сейчас к тебе приедет бригада давай";
+
+    std::string trimmed_result = trim(streaming_result);
+    std::string trimmed_reference = trim(reference);
+
+    std::cout << "Reference:     \"" << trimmed_reference << "\"" << std::endl;
+
+    /* Check if result contains reference (neural networks may add filler words) */
+    if (trimmed_result.find(trimmed_reference) != std::string::npos) {
+        std::cout << "\n[PASS] Transcription contains reference" << std::endl;
+        return 0;
+    } else {
+        std::cerr << "\n[FAIL] Transcription does not contain reference" << std::endl;
         return 1;
     }
-
-    std::cout << "\n[PASS] Got transcription result" << std::endl;
-    return 0;
 }
