@@ -1,7 +1,7 @@
 # Maintainer: Your Name <your@email.com>
 pkgname=nerd-dictation-gigaam
 pkgver=3.0.0
-pkgrel=1
+pkgrel=3
 pkgdesc="GigaAM v3 ASR backend for nerd-dictation (Russian speech recognition)"
 arch=('x86_64')
 url="https://github.com/nerd-voice-interface/nerd-dictation"
@@ -19,7 +19,7 @@ prepare() {
     cd "$_srcdir"
 
     # Initialize submodules if needed
-    if [ ! -f "ThirdParty/sherpa-onnx/CMakeLists.txt" ]; then
+    if [ ! -f "ThirdParty/kaldi-native-fbank/CMakeLists.txt" ]; then
         git submodule update --init --recursive
     fi
 }
@@ -47,10 +47,6 @@ package() {
         "${pkgdir}/usr/lib/libnerd-dictation-gigaam.so.3"
     ln -s libnerd-dictation-gigaam.so.${pkgver} \
         "${pkgdir}/usr/lib/libnerd-dictation-gigaam.so"
-
-    # Install C API header from submodule
-    install -Dm644 ThirdParty/nerd-dictation-api/include/nerd_dictation/backend_api.h \
-        "${pkgdir}/usr/include/nerd_dictation/backend_api.h"
 
     # Install license
     install -Dm644 ThirdParty/nerd-dictation-api/LICENSE \

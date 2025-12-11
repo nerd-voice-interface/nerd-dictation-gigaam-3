@@ -1,7 +1,7 @@
 /**
  * GigaAM ASR Backend - C API Implementation
  *
- * Uses sherpa-onnx with GigaAM NeMo CTC model for Russian language.
+ * Uses direct ONNX inference with GigaAM NeMo CTC model for Russian language.
  * The model can be loaded from:
  *   1. Embedded compressed volumes (decompressed at runtime)
  *   2. External file system path
@@ -11,7 +11,9 @@
  */
 
 #include "nerd_dictation/backend_api.h"
-#include <sherpa-onnx/c-api/c-api.h>
+#include "fbank.h"
+#include "onnx_model.h"
+#include "ctc_decoder.h"
 #include "model_loader.h"
 #include "models/gigaam-v3-ctc/tokens.h"
 #include <cstdlib>
@@ -20,13 +22,10 @@
 #include <vector>
 #include <iostream>
 #include <mutex>
+#include <memory>
 
 #ifndef GIGAAM_MODEL_DIR
 #define GIGAAM_MODEL_DIR "/usr/share/nerd-dictation-gigaam/model"
-#endif
-
-#ifndef GIGAAM_TOKENS_PATH
-#define GIGAAM_TOKENS_PATH GIGAAM_MODEL_DIR "/tokens.txt"
 #endif
 
 /* Get model directory from environment or default */
@@ -38,9 +37,19 @@ static std::string get_model_dir() {
     return GIGAAM_MODEL_DIR;
 }
 
+/* Check if GPU should be used */
+static bool should_use_gpu() {
+    const char* env = std::getenv("GIGAAM_USE_GPU");
+    if (env) {
+        return strcmp(env, "0") != 0 && strcmp(env, "false") != 0;
+    }
+    return true;  /* Default: try GPU */
+}
+
 /* Internal backend structure */
 struct nerd_dictation_backend {
-    const SherpaOnnxOfflineRecognizer* recognizer;
+    std::unique_ptr<gigaam::FbankExtractor> fbank;
+    std::unique_ptr<gigaam::OnnxModel> model;
 
     int sample_rate;
 
@@ -53,7 +62,6 @@ struct nerd_dictation_backend {
 
     /* Model paths (for file-based loading) */
     std::string model_path;
-    std::string tokens_path;
 
     /* Embedded model data (for buffer-based loading) */
     const uint8_t* embedded_model_data;
@@ -73,20 +81,18 @@ extern "C" nerd_dictation_t nerd_dictation_create(void) {
         return nullptr;
     }
 
-    backend->recognizer = nullptr;
     backend->sample_rate = 16000;  /* GigaAM uses 16kHz */
     backend->embedded_model_data = nullptr;
     backend->embedded_model_size = 0;
 
-    /* Configure sherpa-onnx offline recognizer */
-    SherpaOnnxOfflineRecognizerConfig config;
-    memset(&config, 0, sizeof(config));
+    /* Create feature extractor */
+    backend->fbank = std::make_unique<gigaam::FbankExtractor>();
 
-    /* Feature config */
-    config.feat_config.sample_rate = backend->sample_rate;
-    config.feat_config.feature_dim = 64;  /* GigaAM v3 uses 64-dim features */
+    /* Create ONNX model */
+    backend->model = std::make_unique<gigaam::OnnxModel>();
 
     bool use_embedded = gigaam::has_embedded_model();
+    bool use_gpu = should_use_gpu();
 
     if (use_embedded) {
         /* Load embedded model via parallel decompression */
@@ -108,19 +114,17 @@ extern "C" nerd_dictation_t nerd_dictation_create(void) {
         std::cerr << "[GigaAM] Decompressed " << (backend->embedded_model_size / 1024 / 1024)
                   << " MB model into memory" << std::endl;
 
-        /* Use model_buf for buffer-based loading */
-        config.model_config.nemo_ctc.model = "";  /* No file path */
-        config.model_config.nemo_ctc.model_buf = reinterpret_cast<const char*>(backend->embedded_model_data);
-        config.model_config.nemo_ctc.model_buf_size = static_cast<int32_t>(backend->embedded_model_size);
-
-        /* Use embedded tokens */
-        config.model_config.tokens = "";  /* No file path */
-        config.model_config.tokens_buf = gigaam::TOKENS_DATA;
-        config.model_config.tokens_buf_size = gigaam::TOKENS_SIZE;
+        /* Load model from buffer */
+        if (!backend->model->Load(backend->embedded_model_data, backend->embedded_model_size, use_gpu)) {
+            backend->error_message = "Failed to load ONNX model: " + backend->model->GetError();
+            std::cerr << "[GigaAM] ERROR: " << backend->error_message << std::endl;
+            gigaam::free_embedded_model(backend->embedded_model_data, backend->embedded_model_size);
+            delete backend;
+            return nullptr;
+        }
     } else {
         /* Fall back to file-based loading */
         std::string model_dir = get_model_dir();
-        backend->tokens_path = model_dir + "/tokens.txt";
 
         /* Try model.onnx first (fp32), then model.int8.onnx (quantized) */
         backend->model_path = model_dir + "/model.onnx";
@@ -133,69 +137,25 @@ extern "C" nerd_dictation_t nerd_dictation_create(void) {
 
         std::cerr << "[GigaAM] Loading model from file: " << backend->model_path << std::endl;
 
-        /* Check if model file exists */
-        FILE* f = fopen(backend->model_path.c_str(), "r");
-        if (!f) {
-            backend->error_message = "GigaAM: model file not found: " + backend->model_path;
+        /* Load model from file */
+        if (!backend->model->LoadFromFile(backend->model_path, use_gpu)) {
+            backend->error_message = "Failed to load model: " + backend->model->GetError();
             std::cerr << "[GigaAM] ERROR: " << backend->error_message << std::endl;
             delete backend;
             return nullptr;
         }
-        fclose(f);
-
-        config.model_config.nemo_ctc.model = backend->model_path.c_str();
-    }
-
-    /* Check if tokens file exists (only for file-based loading) */
-    if (!use_embedded) {
-        FILE* f = fopen(backend->tokens_path.c_str(), "r");
-        if (!f) {
-            backend->error_message = "GigaAM: tokens file not found: " + backend->tokens_path;
-            std::cerr << "[GigaAM] ERROR: " << backend->error_message << std::endl;
-            delete backend;
-            return nullptr;
-        }
-        fclose(f);
-
-        /* Tokens from file */
-        config.model_config.tokens = backend->tokens_path.c_str();
-    }
-
-    /* General model config */
-    config.model_config.num_threads = 4;
-    config.model_config.provider = "cuda";
-    config.model_config.debug = 0;
-    config.model_config.model_type = "nemo_ctc";  /* Skip auto-detection */
-
-    /* Decoding config */
-    config.decoding_method = "greedy_search";
-    config.max_active_paths = 4;
-
-    /* Create recognizer */
-    backend->recognizer = SherpaOnnxCreateOfflineRecognizer(&config);
-    if (!backend->recognizer) {
-        backend->error_message = "Failed to create GigaAM recognizer";
-        std::cerr << "[GigaAM] ERROR: " << backend->error_message << std::endl;
-        if (backend->embedded_model_data) {
-            gigaam::free_embedded_model(backend->embedded_model_data, backend->embedded_model_size);
-        }
-        delete backend;
-        return nullptr;
     }
 
     std::cerr << "[GigaAM] Model loaded successfully (sample rate: "
               << backend->sample_rate << " Hz, offline mode, "
-              << (use_embedded ? "embedded" : "file") << ")" << std::endl;
+              << (use_embedded ? "embedded" : "file") << ", "
+              << (use_gpu ? "GPU" : "CPU") << ")" << std::endl;
 
     return backend;
 }
 
 extern "C" void nerd_dictation_destroy(nerd_dictation_t backend) {
     if (!backend) return;
-
-    if (backend->recognizer) {
-        SherpaOnnxDestroyOfflineRecognizer(backend->recognizer);
-    }
 
     /* Free embedded model memory if allocated */
     if (backend->embedded_model_data) {
@@ -223,7 +183,7 @@ extern "C" int nerd_dictation_get_info(nerd_dictation_t backend, struct nerd_dic
  * ============================================================================ */
 
 extern "C" int nerd_dictation_feed(nerd_dictation_t backend, const int16_t* samples, size_t num_samples) {
-    if (!backend || !backend->recognizer) return -1;
+    if (!backend || !backend->model || !backend->model->IsLoaded()) return -1;
     if (!samples || num_samples == 0) return 0;
 
     std::lock_guard<std::mutex> lock(backend->buffer_mutex);
@@ -241,7 +201,7 @@ extern "C" int nerd_dictation_feed(nerd_dictation_t backend, const int16_t* samp
 
 extern "C" int nerd_dictation_result(nerd_dictation_t backend, struct nerd_dictation_result* result) {
     if (!backend || !result) return -1;
-    if (!backend->recognizer) return -2;
+    if (!backend->model || !backend->model->IsLoaded()) return -2;
 
     /* For offline model, we can't provide intermediate results */
     result->text = "";
@@ -253,7 +213,7 @@ extern "C" int nerd_dictation_result(nerd_dictation_t backend, struct nerd_dicta
 
 extern "C" int nerd_dictation_finalize(nerd_dictation_t backend, struct nerd_dictation_result* result) {
     if (!backend || !result) return -1;
-    if (!backend->recognizer) return -2;
+    if (!backend->model || !backend->model->IsLoaded()) return -2;
 
     std::lock_guard<std::mutex> lock(backend->buffer_mutex);
 
@@ -265,49 +225,52 @@ extern "C" int nerd_dictation_finalize(nerd_dictation_t backend, struct nerd_dic
         return 0;
     }
 
+    float duration = static_cast<float>(backend->audio_buffer.size()) / backend->sample_rate;
     std::cerr << "[GigaAM] Processing " << backend->audio_buffer.size()
-              << " samples (" << (float)backend->audio_buffer.size() / backend->sample_rate
-              << " seconds)" << std::endl;
+              << " samples (" << duration << " seconds)" << std::endl;
 
-    /* Create stream for this utterance */
-    const SherpaOnnxOfflineStream* stream = SherpaOnnxCreateOfflineStream(backend->recognizer);
-    if (!stream) {
-        backend->error_message = "Failed to create offline stream";
+    /* Extract fbank features */
+    std::vector<float> features = backend->fbank->Extract(
+        backend->audio_buffer.data(),
+        backend->audio_buffer.size()
+    );
+
+    if (features.empty()) {
+        backend->error_message = "Failed to extract features";
         std::cerr << "[GigaAM] ERROR: " << backend->error_message << std::endl;
         return -3;
     }
 
-    /* Accept all accumulated audio */
-    SherpaOnnxAcceptWaveformOffline(
-        stream,
-        backend->sample_rate,
-        backend->audio_buffer.data(),
-        static_cast<int32_t>(backend->audio_buffer.size())
-    );
+    int32_t num_frames = static_cast<int32_t>(features.size() / 64);
+    std::cerr << "[GigaAM] Extracted " << num_frames << " frames" << std::endl;
+
+    /* Run inference */
+    std::vector<float> log_probs = backend->model->Run(features.data(), num_frames);
+
+    if (log_probs.empty()) {
+        backend->error_message = "Inference failed: " + backend->model->GetError();
+        std::cerr << "[GigaAM] ERROR: " << backend->error_message << std::endl;
+        return -4;
+    }
+
+    /* Calculate output frames (subsampling factor = 4) */
+    int32_t output_frames = static_cast<int32_t>(log_probs.size() / backend->model->VocabSize());
+    std::cerr << "[GigaAM] Got " << output_frames << " output frames" << std::endl;
 
     /* Decode */
-    SherpaOnnxDecodeOfflineStream(backend->recognizer, stream);
+    backend->result_text = gigaam::CtcGreedyDecode(
+        log_probs.data(),
+        output_frames,
+        backend->model->VocabSize()
+    );
 
-    /* Get result */
-    const SherpaOnnxOfflineRecognizerResult* sherpa_result =
-        SherpaOnnxGetOfflineStreamResult(stream);
-
-    if (sherpa_result && sherpa_result->text && strlen(sherpa_result->text) > 0) {
-        backend->result_text = sherpa_result->text;
+    if (!backend->result_text.empty()) {
         std::cerr << "[GigaAM] Result: '" << backend->result_text << "'" << std::endl;
-    } else {
-        backend->result_text.clear();
     }
 
     result->text = backend->result_text.c_str();
     result->is_final = 1;
     result->confidence = -1.0f;
-
-    /* Cleanup */
-    if (sherpa_result) {
-        SherpaOnnxDestroyOfflineRecognizerResult(sherpa_result);
-    }
-    SherpaOnnxDestroyOfflineStream(stream);
 
     /* Clear buffer for next utterance */
     backend->audio_buffer.clear();
@@ -336,7 +299,7 @@ extern "C" int nerd_dictation_transcribe_stream(
     void* user_data
 ) {
     if (!backend || !audio_cb) return -1;
-    if (!backend->recognizer) return -2;
+    if (!backend->model || !backend->model->IsLoaded()) return -2;
 
     std::cerr << "[GigaAM] Starting batch recognition (offline mode)" << std::endl;
 

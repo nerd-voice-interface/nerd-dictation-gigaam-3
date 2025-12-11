@@ -28,13 +28,23 @@ if(NOT EXISTS "${GIGAAM_TOKENS_H}")
 endif()
 
 # ============================================================================
-# Find zstd for decompression
+# Find dependencies
 # ============================================================================
 
 find_package(PkgConfig REQUIRED)
-pkg_check_modules(ZSTD REQUIRED libzstd)
 
+# zstd for decompression
+pkg_check_modules(ZSTD REQUIRED libzstd)
 message(STATUS "GigaAM: Found zstd ${ZSTD_VERSION}")
+
+# onnxruntime for inference
+find_library(ONNXRUNTIME_LIB onnxruntime REQUIRED)
+find_path(ONNXRUNTIME_INCLUDE_DIR onnxruntime_cxx_api.h
+    PATHS /usr/include/onnxruntime/core/session
+    REQUIRED
+)
+message(STATUS "GigaAM: Found onnxruntime at ${ONNXRUNTIME_LIB}")
+message(STATUS "GigaAM: onnxruntime headers at ${ONNXRUNTIME_INCLUDE_DIR}")
 
 # ============================================================================
 # Include res_embed for resource embedding
@@ -51,44 +61,39 @@ if(NOT EXISTS "${RES_EMBED_DIR}/CMakeLists.txt")
     )
 endif()
 
-# Disable res_embed example build
+# Build res_embed as static library
 set(BUILD_EXAMPLE OFF CACHE BOOL "" FORCE)
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 
-add_subdirectory(${RES_EMBED_DIR} ${CMAKE_CURRENT_BINARY_DIR}/res_embed)
+add_subdirectory(${RES_EMBED_DIR} ${CMAKE_CURRENT_BINARY_DIR}/res_embed EXCLUDE_FROM_ALL)
+
+# Reset BUILD_SHARED_LIBS for main library
+set(BUILD_SHARED_LIBS ON CACHE BOOL "" FORCE)
 
 # ============================================================================
-# Include sherpa-onnx as submodule
+# Include kaldi-native-fbank for feature extraction
 # ============================================================================
 
-set(SHERPA_ONNX_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/sherpa-onnx")
+set(KALDI_NATIVE_FBANK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/kaldi-native-fbank")
 
-if(NOT EXISTS "${SHERPA_ONNX_DIR}/CMakeLists.txt")
+if(NOT EXISTS "${KALDI_NATIVE_FBANK_DIR}/CMakeLists.txt")
     message(FATAL_ERROR "\n"
-        "sherpa-onnx submodule not found!\n"
+        "kaldi-native-fbank submodule not found!\n"
         "\n"
         "Please initialize the git submodule:\n"
         "  git submodule update --init --recursive\n"
     )
 endif()
 
-# sherpa-onnx settings: C API only, minimal build
-set(SHERPA_ONNX_ENABLE_C_API ON CACHE BOOL "" FORCE)
-set(SHERPA_ONNX_ENABLE_GPU ON CACHE BOOL "" FORCE)
-set(SHERPA_ONNX_ENABLE_PYTHON OFF CACHE BOOL "" FORCE)
-set(SHERPA_ONNX_ENABLE_JNI OFF CACHE BOOL "" FORCE)
-set(SHERPA_ONNX_ENABLE_TESTS OFF CACHE BOOL "" FORCE)
-set(SHERPA_ONNX_ENABLE_WEBSOCKET OFF CACHE BOOL "" FORCE)
-set(SHERPA_ONNX_ENABLE_TTS OFF CACHE BOOL "" FORCE)
-set(BUILD_SHARED_LIBS ON CACHE BOOL "" FORCE)
+# Build kaldi-native-fbank as static library with PIC for shared library linking
+set(KALDI_NATIVE_FBANK_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(KALDI_NATIVE_FBANK_BUILD_PYTHON OFF CACHE BOOL "" FORCE)
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-# Use system onnxruntime
-set(SHERPA_ONNX_USE_PRE_INSTALLED_ONNXRUNTIME_IF_AVAILABLE ON CACHE BOOL "" FORCE)
-set(ENV{SHERPA_ONNXRUNTIME_INCLUDE_DIR} "/usr/include/onnxruntime/core/session")
-set(ENV{SHERPA_ONNXRUNTIME_LIB_DIR} "/usr/lib")
+add_subdirectory(${KALDI_NATIVE_FBANK_DIR} ${CMAKE_CURRENT_BINARY_DIR}/kaldi-native-fbank EXCLUDE_FROM_ALL)
 
-add_subdirectory(${SHERPA_ONNX_DIR} ${CMAKE_CURRENT_BINARY_DIR}/sherpa-onnx)
-
-message(STATUS "GigaAM backend: using sherpa-onnx from ThirdParty/sherpa-onnx")
+message(STATUS "GigaAM: Using kaldi-native-fbank from ThirdParty/kaldi-native-fbank")
 
 # ============================================================================
 # Include nerd-dictation-api (C API header)
@@ -105,7 +110,7 @@ if(NOT EXISTS "${NERD_DICTATION_API_DIR}/CMakeLists.txt")
     )
 endif()
 
-add_subdirectory(${NERD_DICTATION_API_DIR} ${CMAKE_CURRENT_BINARY_DIR}/nerd-dictation-api)
+add_subdirectory(${NERD_DICTATION_API_DIR} ${CMAKE_CURRENT_BINARY_DIR}/nerd-dictation-api EXCLUDE_FROM_ALL)
 
 # ============================================================================
 # Source files
@@ -114,6 +119,9 @@ add_subdirectory(${NERD_DICTATION_API_DIR} ${CMAKE_CURRENT_BINARY_DIR}/nerd-dict
 set(GIGAAM_SOURCES
     src/backend.cpp
     src/model_loader.cpp
+    src/fbank.cpp
+    src/onnx_model.cpp
+    src/ctc_decoder.cpp
 )
 
 # ============================================================================
@@ -129,7 +137,8 @@ target_include_directories(nerd-dictation-gigaam
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}
-    ${SHERPA_ONNX_DIR}/sherpa-onnx/c-api
+    ${KALDI_NATIVE_FBANK_DIR}
+    ${ONNXRUNTIME_INCLUDE_DIR}
     ${RES_EMBED_DIR}/include
     ${ZSTD_INCLUDE_DIRS}
 )
@@ -137,8 +146,9 @@ target_include_directories(nerd-dictation-gigaam
 target_link_libraries(nerd-dictation-gigaam
     PUBLIC
     nerd-dictation-api
-    sherpa-onnx-c-api
-    res_embed
+    kaldi-native-fbank-core
+    ${ONNXRUNTIME_LIB}
+    res_embed_static
     ${ZSTD_LIBRARIES}
 )
 
@@ -177,8 +187,6 @@ foreach(i RANGE 0 16)
     list(APPEND GIGAAM_VOLUME_LIBS "${CMAKE_CURRENT_BINARY_DIR}/libnerd-dictation-gigaam_${vol_name}.a")
 endforeach()
 
-# Note: tokens.txt is installed as a file (sherpa-onnx requires file path for tokens)
-
 message(STATUS "GigaAM: Embedded volumes ready for linking")
 
 # ============================================================================
@@ -208,8 +216,6 @@ install(TARGETS nerd-dictation-gigaam
     RUNTIME DESTINATION bin
 )
 
-# Tokens are now embedded via tokens.h header (no install needed)
-
 # Export symbols for shared library
 set_target_properties(nerd-dictation-gigaam PROPERTIES
     VERSION ${PROJECT_VERSION}
@@ -218,29 +224,31 @@ set_target_properties(nerd-dictation-gigaam PROPERTIES
 )
 
 # ============================================================================
-# Test
+# Test (optional)
 # ============================================================================
 
-add_executable(test_transcribe tests/test_transcribe.cpp)
+option(BUILD_TESTS "Build test executable" OFF)
 
-target_include_directories(test_transcribe PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
-)
+if(BUILD_TESTS)
+    add_executable(test_transcribe tests/test_transcribe.cpp)
 
-# Build volume library list for test
-set(TEST_VOLUME_LIBS "")
-foreach(i RANGE 0 16)
-    if(i LESS 10)
-        set(vol_num "0${i}")
-    else()
-        set(vol_num "${i}")
-    endif()
-    list(APPEND TEST_VOLUME_LIBS "nerd-dictation-gigaam_model_vol_${vol_num}")
-endforeach()
+    target_include_directories(test_transcribe PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
 
-target_link_libraries(test_transcribe PRIVATE
-    nerd-dictation-gigaam
-    ${TEST_VOLUME_LIBS}
-)
+    # Build volume library list for test
+    set(TEST_VOLUME_LIBS "")
+    foreach(i RANGE 0 16)
+        if(i LESS 10)
+            set(vol_num "0${i}")
+        else()
+            set(vol_num "${i}")
+        endif()
+        list(APPEND TEST_VOLUME_LIBS "nerd-dictation-gigaam_model_vol_${vol_num}")
+    endforeach()
 
-# Tokens are now embedded via tokens.h header
+    target_link_libraries(test_transcribe PRIVATE
+        nerd-dictation-gigaam
+        ${TEST_VOLUME_LIBS}
+    )
+endif()
