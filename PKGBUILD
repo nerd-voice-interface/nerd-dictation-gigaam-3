@@ -1,12 +1,12 @@
 # Maintainer: Your Name <your@email.com>
 pkgname=nerd-dictation-gigaam
 pkgver=3.0.0
-pkgrel=3
+pkgrel=4
 pkgdesc="GigaAM v3 ASR backend for nerd-dictation (Russian speech recognition)"
 arch=('x86_64')
 url="https://github.com/nerd-voice-interface/nerd-dictation"
 license=('MIT')
-depends=('onnxruntime' 'gcc-libs' 'glibc' 'zstd')
+depends=('onnxruntime-gpu-sm61' 'gcc-libs' 'glibc' 'zstd')
 makedepends=('git' 'cmake')
 provides=('nerd-dictation-backend')
 source=()
