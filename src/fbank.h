@@ -18,11 +18,12 @@ namespace gigaam {
  * GigaAM-specific FBank parameters:
  * - sample_rate: 16000 Hz
  * - num_mel_bins: 64
- * - frame_length: 25ms (400 samples)
+ * - frame_length: 25ms (n_fft=400)
  * - frame_shift: 10ms (160 samples)
  * - low_freq: 0 Hz
  * - high_freq: 8000 Hz
- * - window: povey
+ * - window: hann
+ * - preemph_coeff: 0.0 (no preemphasis)
  * - remove_dc_offset: false
  * - dither: 0.0
  */
@@ -42,7 +43,7 @@ public:
      * @param samples Audio samples normalized to [-1, 1]
      * @param num_samples Number of samples
      * @return Features as flattened array (num_frames * 64)
-     *         Features are per_feature normalized (zero mean, unit variance)
+     *         Note: GigaAM expects raw log-mel features (no additional normalization)
      */
     std::vector<float> Extract(const float* samples, size_t num_samples);
 

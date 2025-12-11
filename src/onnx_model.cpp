@@ -204,9 +204,6 @@ private:
                 }
             } catch (...) {}
 
-            std::cerr << "[GigaAM] Model metadata: vocab_size=" << vocab_size_
-                      << ", subsampling_factor=" << subsampling_factor_ << std::endl;
-
         } catch (const Ort::Exception& e) {
             std::cerr << "[GigaAM] Failed to read metadata: " << e.what() << std::endl;
         }
