@@ -13,15 +13,15 @@ set(GIGAAM_MODEL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/models/gigaam-v3-ctc")
 set(GIGAAM_VOLUMES_DIR "${GIGAAM_MODEL_DIR}/volumes")
 set(GIGAAM_TOKENS_H "${GIGAAM_MODEL_DIR}/tokens.h")
 
-# Check model files exist for build
-if(NOT EXISTS "${GIGAAM_VOLUMES_DIR}/part_00.zst")
-    message(FATAL_ERROR "\n"
-        "GigaAM v3 compressed volumes not found: ${GIGAAM_VOLUMES_DIR}/part_00.zst\n"
-        "\n"
-        "Please run the compression script first:\n"
-        "  python scripts/compress_model.py models/gigaam-v3-ctc/model.onnx models/gigaam-v3-ctc/volumes\n"
-    )
+# The repository keeps the UPSTREAM model in these volumes. The model the
+# library embeds is derived from it at build time by scripts/build_model.py
+# (exact graph rewrites, see scripts/optimize_model.py), into the build tree.
+file(GLOB GIGAAM_UPSTREAM_VOLUMES "${GIGAAM_VOLUMES_DIR}/part_*.zst")
+if(NOT GIGAAM_UPSTREAM_VOLUMES)
+    message(FATAL_ERROR "GigaAM v3 upstream volumes not found in ${GIGAAM_VOLUMES_DIR}")
 endif()
+set(GIGAAM_NUM_VOLUMES 17)
+set(GIGAAM_BUILT_DIR "${CMAKE_CURRENT_BINARY_DIR}/gigaam-model")
 
 if(NOT EXISTS "${GIGAAM_TOKENS_H}")
     message(FATAL_ERROR "GigaAM tokens header not found: ${GIGAAM_TOKENS_H}")
@@ -32,6 +32,8 @@ endif()
 # ============================================================================
 
 find_package(PkgConfig REQUIRED)
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+find_program(ZSTD_EXECUTABLE zstd REQUIRED)
 
 # zstd for decompression
 pkg_check_modules(ZSTD REQUIRED libzstd)
@@ -140,6 +142,7 @@ target_include_directories(nerd-dictation-gigaam
     ${KALDI_NATIVE_FBANK_DIR}
     ${ONNXRUNTIME_INCLUDE_DIR}
     ${RES_EMBED_DIR}/include
+    ${GIGAAM_BUILT_DIR}
     ${ZSTD_INCLUDE_DIRS}
 )
 
@@ -160,15 +163,37 @@ target_compile_definitions(nerd-dictation-gigaam PRIVATE
 )
 
 # ============================================================================
-# Embed compressed model volumes (17 volumes × ~26 MB each = ~428 MB total)
+# Build the embedded model from the upstream one, then embed its volumes
 # ============================================================================
 
-message(STATUS "GigaAM: Embedding 17 compressed model volumes...")
+math(EXPR GIGAAM_LAST_VOLUME "${GIGAAM_NUM_VOLUMES} - 1")
+set(GIGAAM_BUILT_VOLUMES "")
+foreach(i RANGE 0 ${GIGAAM_LAST_VOLUME})
+    if(i LESS 10)
+        list(APPEND GIGAAM_BUILT_VOLUMES "${GIGAAM_BUILT_DIR}/part_0${i}.zst")
+    else()
+        list(APPEND GIGAAM_BUILT_VOLUMES "${GIGAAM_BUILT_DIR}/part_${i}.zst")
+    endif()
+endforeach()
+
+add_custom_command(
+    OUTPUT ${GIGAAM_BUILT_VOLUMES} "${GIGAAM_BUILT_DIR}/model_volumes.h"
+    COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/scripts/build_model.py"
+            "${GIGAAM_VOLUMES_DIR}" "${GIGAAM_BUILT_DIR}" ${GIGAAM_NUM_VOLUMES}
+    DEPENDS ${GIGAAM_UPSTREAM_VOLUMES}
+            "${CMAKE_CURRENT_SOURCE_DIR}/scripts/build_model.py"
+            "${CMAKE_CURRENT_SOURCE_DIR}/scripts/optimize_model.py"
+    COMMENT "GigaAM: building the embedded model (exact rewrites, zstd -19)"
+    VERBATIM)
+add_custom_target(gigaam-model DEPENDS ${GIGAAM_BUILT_VOLUMES} "${GIGAAM_BUILT_DIR}/model_volumes.h")
+add_dependencies(nerd-dictation-gigaam gigaam-model)
+
+message(STATUS "GigaAM: Embedding ${GIGAAM_NUM_VOLUMES} compressed model volumes...")
 
 # Volume names for res_embed and whole-archive linking
 set(GIGAAM_VOLUME_LIBS "")
 
-foreach(i RANGE 0 16)
+foreach(i RANGE 0 ${GIGAAM_LAST_VOLUME})
     if(i LESS 10)
         set(vol_num "0${i}")
     else()
@@ -176,13 +201,12 @@ foreach(i RANGE 0 16)
     endif()
 
     set(vol_name "model_vol_${vol_num}")
-    set(vol_path "${GIGAAM_VOLUMES_DIR}/part_${vol_num}.zst")
-
-    if(NOT EXISTS "${vol_path}")
-        message(FATAL_ERROR "Volume not found: ${vol_path}")
-    endif()
+    set(vol_path "${GIGAAM_BUILT_DIR}/part_${vol_num}.zst")
 
     res_embed(TARGET nerd-dictation-gigaam NAME "${vol_name}" PATH "${vol_path}" KEYWORD)
+    # The volume is an output of gigaam-model: build it first, once (in
+    # parallel, Make would otherwise run build_model.py for each consumer).
+    add_dependencies(nerd-dictation-gigaam_${vol_name} gigaam-model)
 
     list(APPEND GIGAAM_VOLUME_LIBS "${CMAKE_CURRENT_BINARY_DIR}/libnerd-dictation-gigaam_${vol_name}.a")
 endforeach()
@@ -238,7 +262,7 @@ if(BUILD_TESTS)
 
     # Build volume library list for test
     set(TEST_VOLUME_LIBS "")
-    foreach(i RANGE 0 16)
+    foreach(i RANGE 0 ${GIGAAM_LAST_VOLUME})
         if(i LESS 10)
             set(vol_num "0${i}")
         else()

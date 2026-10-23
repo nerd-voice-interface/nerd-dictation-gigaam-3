@@ -15,21 +15,7 @@ public:
 
     bool Load(const void* data, size_t size, bool use_gpu) {
         try {
-            Ort::SessionOptions session_opts;
-            session_opts.SetIntraOpNumThreads(4);
-            session_opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
-
-            if (use_gpu) {
-                try {
-                    OrtCUDAProviderOptions cuda_opts;
-                    cuda_opts.device_id = 0;
-                    session_opts.AppendExecutionProvider_CUDA(cuda_opts);
-                    std::cerr << "[GigaAM] Using CUDA execution provider" << std::endl;
-                } catch (const Ort::Exception& e) {
-                    std::cerr << "[GigaAM] CUDA not available: " << e.what()
-                              << ", falling back to CPU" << std::endl;
-                }
-            }
+            Ort::SessionOptions session_opts = MakeSessionOptions(use_gpu);
 
             session_ = std::make_unique<Ort::Session>(
                 env_,
@@ -60,21 +46,7 @@ public:
 
     bool LoadFromFile(const std::string& path, bool use_gpu) {
         try {
-            Ort::SessionOptions session_opts;
-            session_opts.SetIntraOpNumThreads(4);
-            session_opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
-
-            if (use_gpu) {
-                try {
-                    OrtCUDAProviderOptions cuda_opts;
-                    cuda_opts.device_id = 0;
-                    session_opts.AppendExecutionProvider_CUDA(cuda_opts);
-                    std::cerr << "[GigaAM] Using CUDA execution provider" << std::endl;
-                } catch (const Ort::Exception& e) {
-                    std::cerr << "[GigaAM] CUDA not available: " << e.what()
-                              << ", falling back to CPU" << std::endl;
-                }
-            }
+            Ort::SessionOptions session_opts = MakeSessionOptions(use_gpu);
 
             session_ = std::make_unique<Ort::Session>(
                 env_,
@@ -183,6 +155,31 @@ public:
     int32_t SubsamplingFactor() const { return subsampling_factor_; }
 
 private:
+    static Ort::SessionOptions MakeSessionOptions(bool use_gpu) {
+        Ort::SessionOptions session_opts;
+        session_opts.SetIntraOpNumThreads(4);
+        session_opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+
+        if (use_gpu) {
+            try {
+                OrtCUDAProviderOptions cuda_opts;
+                cuda_opts.device_id = 0;
+                // Pinned, not left to the default: on the Quadro P500 the
+                // DEFAULT search is 3.5x slower than EXHAUSTIVE/HEURISTIC,
+                // which run equally fast; EXHAUSTIVE costs ~2 ms on the
+                // first segment of each new length (measured, see
+                // gigaam-profile), as HEURISTIC does.
+                cuda_opts.cudnn_conv_algo_search = OrtCudnnConvAlgoSearchExhaustive;
+                session_opts.AppendExecutionProvider_CUDA(cuda_opts);
+                std::cerr << "[GigaAM] Using CUDA execution provider" << std::endl;
+            } catch (const Ort::Exception& e) {
+                std::cerr << "[GigaAM] CUDA not available: " << e.what()
+                          << ", falling back to CPU" << std::endl;
+            }
+        }
+        return session_opts;
+    }
+
     void ReadMetadata() {
         try {
             Ort::AllocatorWithDefaultOptions allocator;
