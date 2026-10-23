@@ -6,8 +6,19 @@
 #include <onnxruntime_cxx_api.h>
 #include <iostream>
 #include <algorithm>
+#include <filesystem>
+#include <string>
+#include <unordered_map>
 
 namespace gigaam {
+
+// cuBLAS SGEMM algorithm per GEMM shape of the embedded model, tuned in place
+// on the Quadro P500 (gigaam-profile: tune_table.py). onnxruntime-gpu-sm61
+// uses it through its sgemm_algo_table option; shapes it does not list, and
+// other GPUs, keep cuBLAS's default choice. Must be re-tuned when the
+// embedded graph changes (scripts/optimize_model.py).
+static const char* const kSgemmAlgoTable =
+    "/usr/share/nerd-dictation-gigaam/sgemm-p500-gigaam.tsv";
 
 class OnnxModel::Impl {
 public:
@@ -162,16 +173,25 @@ private:
 
         if (use_gpu) {
             try {
-                OrtCUDAProviderOptions cuda_opts;
-                cuda_opts.device_id = 0;
-                // Pinned, not left to the default: on the Quadro P500 the
-                // DEFAULT search is 3.5x slower than EXHAUSTIVE/HEURISTIC,
-                // which run equally fast; EXHAUSTIVE costs ~2 ms on the
-                // first segment of each new length (measured, see
-                // gigaam-profile), as HEURISTIC does.
-                cuda_opts.cudnn_conv_algo_search = OrtCudnnConvAlgoSearchExhaustive;
-                session_opts.AppendExecutionProvider_CUDA(cuda_opts);
-                std::cerr << "[GigaAM] Using CUDA execution provider" << std::endl;
+                std::unordered_map<std::string, std::string> opts{
+                    {"device_id", "0"},
+                    // Pinned, not left to the default: on the Quadro P500 the
+                    // DEFAULT search is 3.5x slower than EXHAUSTIVE/HEURISTIC,
+                    // which run equally fast; EXHAUSTIVE costs ~2 ms on the
+                    // first segment of each new length (measured, see
+                    // gigaam-profile), as HEURISTIC does.
+                    {"cudnn_conv_algo_search", "EXHAUSTIVE"},
+                };
+                if (std::filesystem::exists(kSgemmAlgoTable))
+                    opts["sgemm_algo_table"] = kSgemmAlgoTable;
+                Ort::CUDAProviderOptions cuda_opts;
+                cuda_opts.Update(opts);
+                session_opts.AppendExecutionProvider_CUDA_V2(*cuda_opts);
+                std::cerr << "[GigaAM] Using CUDA execution provider"
+                          << (opts.count("sgemm_algo_table")
+                                  ? std::string(", SGEMM algorithms from ") + kSgemmAlgoTable
+                                  : std::string())
+                          << std::endl;
             } catch (const Ort::Exception& e) {
                 std::cerr << "[GigaAM] CUDA not available: " << e.what()
                           << ", falling back to CPU" << std::endl;
