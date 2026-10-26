@@ -1,7 +1,7 @@
 # Maintainer: Your Name <your@email.com>
 pkgname=nerd-dictation-gigaam
 pkgver=3.0.0
-pkgrel=7
+pkgrel=8
 pkgdesc="GigaAM v3 ASR backend for nerd-dictation (Russian speech recognition)"
 arch=('x86_64')
 url="https://github.com/nerd-voice-interface/nerd-dictation"

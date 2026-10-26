@@ -39,14 +39,24 @@ find_program(ZSTD_EXECUTABLE zstd REQUIRED)
 pkg_check_modules(ZSTD REQUIRED libzstd)
 message(STATUS "GigaAM: Found zstd ${ZSTD_VERSION}")
 
-# onnxruntime for inference
-find_library(ONNXRUNTIME_LIB onnxruntime REQUIRED)
-find_path(ONNXRUNTIME_INCLUDE_DIR onnxruntime_cxx_api.h
-    PATHS /usr/include/onnxruntime/core/session
-    REQUIRED
-)
-message(STATUS "GigaAM: Found onnxruntime at ${ONNXRUNTIME_LIB}")
-message(STATUS "GigaAM: onnxruntime headers at ${ONNXRUNTIME_INCLUDE_DIR}")
+# onnxruntime for inference. Arch's onnxruntime(-cuda) ships a CMake package
+# (onnxruntime::onnxruntime, headers in include/onnxruntime); builds without
+# one (onnxruntime-gpu-sm61) install the headers in the source tree layout,
+# include/onnxruntime/core/session.
+find_package(onnxruntime CONFIG QUIET)
+if(TARGET onnxruntime::onnxruntime)
+    set(ONNXRUNTIME_LIB onnxruntime::onnxruntime)
+    set(ONNXRUNTIME_INCLUDE_DIR "")
+    message(STATUS "GigaAM: onnxruntime ${onnxruntime_VERSION} CMake package from ${onnxruntime_DIR}")
+else()
+    find_library(ONNXRUNTIME_LIB onnxruntime REQUIRED)
+    find_path(ONNXRUNTIME_INCLUDE_DIR onnxruntime_cxx_api.h
+        PATH_SUFFIXES onnxruntime onnxruntime/core/session
+        REQUIRED
+    )
+    message(STATUS "GigaAM: Found onnxruntime at ${ONNXRUNTIME_LIB}")
+    message(STATUS "GigaAM: onnxruntime headers at ${ONNXRUNTIME_INCLUDE_DIR}")
+endif()
 
 # ============================================================================
 # Include res_embed for resource embedding

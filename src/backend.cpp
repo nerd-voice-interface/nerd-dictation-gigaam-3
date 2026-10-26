@@ -146,10 +146,15 @@ extern "C" nerd_dictation_t nerd_dictation_create(void) {
         }
     }
 
+    bool cuda = backend->model->UsesCuda();
     std::cerr << "[GigaAM] Model loaded successfully (sample rate: "
               << backend->sample_rate << " Hz, offline mode, "
-              << (use_embedded ? "embedded" : "file") << ", "
-              << (use_gpu ? "GPU" : "CPU") << ")" << std::endl;
+              << (use_embedded ? "embedded" : "file") << ", providers: "
+              << (cuda ? "CUDAExecutionProvider, CPUExecutionProvider"
+                       : "CPUExecutionProvider") << ")" << std::endl;
+    if (use_gpu && !cuda)
+        std::cerr << "[GigaAM] WARNING: GPU was requested, but the model runs on "
+                     "the CPU (see the CUDA messages above)" << std::endl;
 
     return backend;
 }

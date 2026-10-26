@@ -72,64 +72,15 @@ public:
     Impl() : env_(ORT_LOGGING_LEVEL_WARNING, "gigaam") {}
 
     bool Load(const void* data, size_t size, bool use_gpu) {
-        try {
-            Ort::SessionOptions session_opts = MakeSessionOptions(use_gpu);
-
-            session_ = std::make_unique<Ort::Session>(
-                env_,
-                data,
-                size,
-                session_opts
-            );
-
-            // Get input/output names
-            Ort::AllocatorWithDefaultOptions allocator;
-
-            auto input_name = session_->GetInputNameAllocated(0, allocator);
-            input_name_ = input_name.get();
-
-            auto output_name = session_->GetOutputNameAllocated(0, allocator);
-            output_name_ = output_name.get();
-
-            // Read metadata
-            ReadMetadata();
-
-            return true;
-        } catch (const Ort::Exception& e) {
-            error_ = std::string("ONNX error: ") + e.what();
-            std::cerr << "[GigaAM] " << error_ << std::endl;
-            return false;
-        }
+        return Create(use_gpu, [&](const Ort::SessionOptions& opts) {
+            return std::make_unique<Ort::Session>(env_, data, size, opts);
+        });
     }
 
     bool LoadFromFile(const std::string& path, bool use_gpu) {
-        try {
-            Ort::SessionOptions session_opts = MakeSessionOptions(use_gpu);
-
-            session_ = std::make_unique<Ort::Session>(
-                env_,
-                path.c_str(),
-                session_opts
-            );
-
-            // Get input/output names
-            Ort::AllocatorWithDefaultOptions allocator;
-
-            auto input_name = session_->GetInputNameAllocated(0, allocator);
-            input_name_ = input_name.get();
-
-            auto output_name = session_->GetOutputNameAllocated(0, allocator);
-            output_name_ = output_name.get();
-
-            // Read metadata
-            ReadMetadata();
-
-            return true;
-        } catch (const Ort::Exception& e) {
-            error_ = std::string("ONNX error: ") + e.what();
-            std::cerr << "[GigaAM] " << error_ << std::endl;
-            return false;
-        }
+        return Create(use_gpu, [&](const Ort::SessionOptions& opts) {
+            return std::make_unique<Ort::Session>(env_, path.c_str(), opts);
+        });
     }
 
     std::vector<float> Run(const float* features, int32_t num_frames) {
@@ -208,17 +159,75 @@ public:
     }
 
     bool IsLoaded() const { return session_ != nullptr; }
+    bool UsesCuda() const { return cuda_; }
     const std::string& GetError() const { return error_; }
     int32_t VocabSize() const { return vocab_size_; }
     int32_t SubsamplingFactor() const { return subsampling_factor_; }
 
 private:
-    static Ort::SessionOptions MakeSessionOptions(bool use_gpu) {
+    // Creates the session, with the CUDA EP if use_gpu and it can be had.
+    // onnxruntime loads the CUDA provider library when the EP is appended
+    // (an unloadable library fails there, see MakeSessionOptions), and builds
+    // the CUDA EP (device, cuBLAS/cuDNN handles) at session creation, where a
+    // failure throws instead of falling back. So cuda_ is true exactly when a
+    // session with the CUDA EP was created; on a creation failure with CUDA
+    // the session is retried on the CPU alone.
+    template <typename MakeSession>
+    bool Create(bool use_gpu, MakeSession make) {
+        try {
+            Ort::SessionOptions session_opts = MakeSessionOptions(use_gpu, cuda_);
+            try {
+                session_ = make(session_opts);
+            } catch (const Ort::Exception& e) {
+                if (!cuda_)
+                    throw;
+                std::cerr << "[GigaAM] WARNING: session creation with the CUDA "
+                             "execution provider failed: " << e.what()
+                          << "; retrying on the CPU" << std::endl;
+                session_opts = MakeSessionOptions(false, cuda_);
+                session_ = make(session_opts);
+            }
+
+            Ort::AllocatorWithDefaultOptions allocator;
+            input_name_ = session_->GetInputNameAllocated(0, allocator).get();
+            output_name_ = session_->GetOutputNameAllocated(0, allocator).get();
+            ReadMetadata();
+            return true;
+        } catch (const Ort::Exception& e) {
+            error_ = std::string("ONNX error: ") + e.what();
+            std::cerr << "[GigaAM] " << error_ << std::endl;
+            return false;
+        }
+    }
+
+    // Makes libcudnn.so.9's symbols global before onnxruntime dlopens its CUDA
+    // provider library. Arch's onnxruntime-cuda 1.29.0-3 ships a
+    // libonnxruntime_providers_cuda.so without a NEEDED entry for
+    // libcudnn.so.9, so loading it fails with an undefined cudnn* symbol (see
+    // docs/arch-onnxruntime-cuda-cudnn-needed.md). Where the provider links
+    // cuDNN properly this only loads early what it would load anyway.
+    static void PreloadCudnn() {
+        static const bool done = [] {
+            void* h = dlopen("libcudnn.so.9", RTLD_NOW | RTLD_GLOBAL);
+            if (h)
+                std::cerr << "[GigaAM] Preloaded libcudnn.so.9 (RTLD_GLOBAL) for the "
+                             "CUDA execution provider" << std::endl;
+            else
+                std::cerr << "[GigaAM] libcudnn.so.9 not preloaded: " << dlerror()
+                          << std::endl;
+            return true;
+        }();
+        (void)done;
+    }
+
+    static Ort::SessionOptions MakeSessionOptions(bool use_gpu, bool& cuda) {
+        cuda = false;
         Ort::SessionOptions session_opts;
         session_opts.SetIntraOpNumThreads(4);
         session_opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
 
         if (use_gpu) {
+            PreloadCudnn();
             try {
                 std::unordered_map<std::string, std::string> opts{
                     {"device_id", "0"},
@@ -229,34 +238,37 @@ private:
                     // gigaam-profile), as HEURISTIC does.
                     {"cudnn_conv_algo_search", "EXHAUSTIVE"},
                 };
+                // The first Update loads the CUDA provider library, so a
+                // provider that cannot be loaded fails here, before the
+                // sgemm_algo_table probe below.
                 Ort::CUDAProviderOptions cuda_opts;
+                cuda_opts.Update(opts);
                 std::string table = SgemmTableForThisGpu();
                 if (!table.empty()) {
                     auto with_table = opts;
                     with_table["sgemm_algo_table"] = table;
+                    Ort::CUDAProviderOptions probe;
                     try {
-                        cuda_opts.Update(with_table);
+                        probe.Update(with_table);
+                        cuda_opts = std::move(probe);
                         opts = with_table;
                     } catch (const Ort::Exception& e) {
                         // A stock onnxruntime has no such option: run without.
                         std::cerr << "[GigaAM] this onnxruntime does not take "
                                      "sgemm_algo_table (" << e.what()
                                   << "); using cuBLAS's default algorithms" << std::endl;
-                        cuda_opts = Ort::CUDAProviderOptions();
-                        cuda_opts.Update(opts);
                     }
-                } else {
-                    cuda_opts.Update(opts);
                 }
                 session_opts.AppendExecutionProvider_CUDA_V2(*cuda_opts);
-                std::cerr << "[GigaAM] Using CUDA execution provider"
+                cuda = true;
+                std::cerr << "[GigaAM] Appended CUDA execution provider"
                           << (opts.count("sgemm_algo_table")
                                   ? ", SGEMM algorithms from " + opts["sgemm_algo_table"]
                                   : std::string())
                           << std::endl;
             } catch (const Ort::Exception& e) {
-                std::cerr << "[GigaAM] CUDA not available: " << e.what()
-                          << ", falling back to CPU" << std::endl;
+                std::cerr << "[GigaAM] WARNING: CUDA execution provider not available: "
+                          << e.what() << "; falling back to the CPU" << std::endl;
             }
         }
         return session_opts;
@@ -290,6 +302,7 @@ private:
 
     Ort::Env env_;
     std::unique_ptr<Ort::Session> session_;
+    bool cuda_ = false;
     std::string input_name_;
     std::string output_name_;
     std::string error_;
@@ -324,6 +337,10 @@ std::vector<float> OnnxModel::Run(const float* features, int32_t num_frames) {
     auto result = impl_->Run(features, num_frames);
     error_ = impl_->GetError();
     return result;
+}
+
+bool OnnxModel::UsesCuda() const {
+    return impl_->UsesCuda();
 }
 
 bool OnnxModel::IsLoaded() const {

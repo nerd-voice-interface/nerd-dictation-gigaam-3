@@ -74,6 +74,13 @@ public:
     bool IsLoaded() const;
 
     /**
+     * True if the loaded session has the CUDA execution provider (nodes it
+     * does not support still run on the CPU provider); false if it runs on
+     * the CPU provider alone.
+     */
+    bool UsesCuda() const;
+
+    /**
      * Get last error message
      */
     const std::string& GetError() const { return error_; }
