@@ -6,6 +6,8 @@
 #include <onnxruntime_cxx_api.h>
 #include <iostream>
 #include <algorithm>
+#include <cctype>
+#include <dlfcn.h>
 #include <filesystem>
 #include <string>
 #include <unordered_map>
@@ -13,12 +15,57 @@
 namespace gigaam {
 
 // cuBLAS SGEMM algorithm per GEMM shape of the embedded model, tuned in place
-// on the Quadro P500 (gigaam-profile: tune_table.py). onnxruntime-gpu-sm61
-// uses it through its sgemm_algo_table option; shapes it does not list, and
-// other GPUs, keep cuBLAS's default choice. Must be re-tuned when the
-// embedded graph changes (scripts/optimize_model.py).
-static const char* const kSgemmAlgoTable =
-    "/usr/share/nerd-dictation-gigaam/sgemm-p500-gigaam.tsv";
+// for one GPU model (gigaam-profile: tune_table.py) and named after it:
+// <dir>/<gpu name, lower case, non-alphanumerics as '-'>.tsv, e.g.
+// quadro-p500.tsv. onnxruntime-gpu-sm61 takes it through its sgemm_algo_table
+// CUDA option; a stock onnxruntime does not know the option, and then the
+// model simply runs with cuBLAS's default choice. Tables must be re-tuned when
+// the embedded graph changes (scripts/optimize_model.py).
+static const char* const kSgemmTableDir = "/usr/share/nerd-dictation-gigaam/sgemm";
+
+// The name of CUDA device 0 (as onnxruntime's device_id 0 sees it), from the
+// driver API, loaded at run time so the backend links no CUDA library.
+static std::string CudaDeviceName() {
+    void* lib = dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL);
+    if (!lib)
+        return {};
+    using Init = int (*)(unsigned);
+    using Get = int (*)(int*, int);
+    using Name = int (*)(char*, int, int);
+    auto init = reinterpret_cast<Init>(dlsym(lib, "cuInit"));
+    auto get = reinterpret_cast<Get>(dlsym(lib, "cuDeviceGet"));
+    auto name = reinterpret_cast<Name>(dlsym(lib, "cuDeviceGetName"));
+    char buf[256] = {};
+    int dev = 0;
+    std::string result;
+    if (init && get && name && init(0) == 0 && get(&dev, 0) == 0 &&
+        name(buf, sizeof buf, dev) == 0)
+        result = buf;
+    dlclose(lib);
+    return result;
+}
+
+// The table for this GPU, or "" if there is none.
+static std::string SgemmTableForThisGpu() {
+    std::string gpu = CudaDeviceName();
+    if (gpu.empty())
+        return {};
+    std::string slug;
+    for (unsigned char c : gpu) {
+        if (std::isalnum(c))
+            slug += static_cast<char>(std::tolower(c));
+        else if (!slug.empty() && slug.back() != '-')
+            slug += '-';
+    }
+    while (!slug.empty() && slug.back() == '-')
+        slug.pop_back();
+    std::string path = std::string(kSgemmTableDir) + "/" + slug + ".tsv";
+    std::cerr << "[GigaAM] GPU \"" << gpu << "\": "
+              << (std::filesystem::exists(path) ? "SGEMM table " + path
+                                                : "no SGEMM table (" + path + ")")
+              << std::endl;
+    return std::filesystem::exists(path) ? path : std::string();
+}
 
 class OnnxModel::Impl {
 public:
@@ -182,14 +229,29 @@ private:
                     // gigaam-profile), as HEURISTIC does.
                     {"cudnn_conv_algo_search", "EXHAUSTIVE"},
                 };
-                if (std::filesystem::exists(kSgemmAlgoTable))
-                    opts["sgemm_algo_table"] = kSgemmAlgoTable;
                 Ort::CUDAProviderOptions cuda_opts;
-                cuda_opts.Update(opts);
+                std::string table = SgemmTableForThisGpu();
+                if (!table.empty()) {
+                    auto with_table = opts;
+                    with_table["sgemm_algo_table"] = table;
+                    try {
+                        cuda_opts.Update(with_table);
+                        opts = with_table;
+                    } catch (const Ort::Exception& e) {
+                        // A stock onnxruntime has no such option: run without.
+                        std::cerr << "[GigaAM] this onnxruntime does not take "
+                                     "sgemm_algo_table (" << e.what()
+                                  << "); using cuBLAS's default algorithms" << std::endl;
+                        cuda_opts = Ort::CUDAProviderOptions();
+                        cuda_opts.Update(opts);
+                    }
+                } else {
+                    cuda_opts.Update(opts);
+                }
                 session_opts.AppendExecutionProvider_CUDA_V2(*cuda_opts);
                 std::cerr << "[GigaAM] Using CUDA execution provider"
                           << (opts.count("sgemm_algo_table")
-                                  ? std::string(", SGEMM algorithms from ") + kSgemmAlgoTable
+                                  ? ", SGEMM algorithms from " + opts["sgemm_algo_table"]
                                   : std::string())
                           << std::endl;
             } catch (const Ort::Exception& e) {

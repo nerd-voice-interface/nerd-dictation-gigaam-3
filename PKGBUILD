@@ -1,13 +1,15 @@
 # Maintainer: Your Name <your@email.com>
 pkgname=nerd-dictation-gigaam
 pkgver=3.0.0
-pkgrel=6
+pkgrel=7
 pkgdesc="GigaAM v3 ASR backend for nerd-dictation (Russian speech recognition)"
 arch=('x86_64')
 url="https://github.com/nerd-voice-interface/nerd-dictation"
 license=('MIT')
-# >= 1.23.2-3: the sgemm_algo_table CUDA provider option
-depends=('onnxruntime-gpu-sm61>=1.23.2-3' 'gcc-libs' 'glibc' 'zstd')
+# Any onnxruntime with CUDA: the official onnxruntime-cuda (CUDA 13: Turing and
+# newer) or onnxruntime-gpu-sm61 (CUDA 12.9, Pascal), which also takes the
+# per-GPU SGEMM tables. Both provide 'onnxruntime'.
+depends=('onnxruntime' 'gcc-libs' 'glibc' 'zstd')
 makedepends=('git' 'cmake' 'python' 'python-onnx' 'python-numpy' 'zstd')
 provides=('nerd-dictation-backend')
 source=()
@@ -52,8 +54,7 @@ package() {
         "${pkgdir}/usr/lib/libnerd-dictation-gigaam.so"
 
     # cuBLAS algorithm table for the embedded model (see src/onnx_model.cpp)
-    install -Dm644 data/sgemm-p500-gigaam.tsv \
-        "${pkgdir}/usr/share/${pkgname}/sgemm-p500-gigaam.tsv"
+    install -Dm644 data/sgemm/*.tsv -t "${pkgdir}/usr/share/${pkgname}/sgemm"
 
     # Install license
     install -Dm644 ThirdParty/nerd-dictation-api/LICENSE \
